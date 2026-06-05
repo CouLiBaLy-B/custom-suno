@@ -1,0 +1,219 @@
+# ============================================================
+#  🚀 CI/CD - Déploiement automatique sur Hugging Face Spaces
+# ============================================================
+# Variables requises (Settings → Secrets and variables → Actions):
+#   Secrets:
+#     - HF_TOKEN: Token Hugging Face (lecture/écriture)
+#   Variables:
+#     - HF_USERNAME: Votre username HF (ex: CouLiBaLy-B)
+#     - HF_SPACE_NAME: Nom du Space (ex: ai-music-studio)
+# ============================================================
+
+name: 🚀 Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Permet le lancement manuel
+
+concurrency:
+  group: hf-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  #  Job 1: Tests
+  # ─────────────────────────────────────────────
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: 📦 Install dependencies (core only for tests)
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pydantic>=2.6.4 \
+            pydantic-settings>=2.2.1 \
+            sqlalchemy>=2.0.29 \
+            numpy>=1.26.4 \
+            soundfile>=0.12.1 \
+            pytest>=8.1.1 \
+            loguru>=0.7.2
+
+      - name: 🧪 Run unit tests
+        run: |
+          python -m pytest tests/ -v --tb=short
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────
+  #  Job 2: Deploy to Hugging Face Spaces
+  # ─────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to HF Spaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: 📦 Install HF CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub "huggingface_hub[cli]" hf-transfer
+
+      - name: 🔑 Check required secrets
+        run: |
+          if [ -z "${{ secrets.HF_TOKEN }}" ]; then
+            echo "❌ Erreur: Le secret HF_TOKEN n'est pas configuré !"
+            echo "➡️ Allez dans Settings → Secrets and variables → Actions → New secret"
+            echo "➡️ Nom: HF_TOKEN, Valeur: votre token HF (hf_xxx...)"
+            exit 1
+          fi
+          if [ -z "${{ vars.HF_USERNAME }}" ]; then
+            echo "❌ Erreur: La variable HF_USERNAME n'est pas configurée !"
+            echo "➡️ Allez dans Settings → Secrets and variables → Actions → New variable"
+            echo "➡️ Nom: HF_USERNAME, Valeur: votre username HF"
+            exit 1
+          fi
+          if [ -z "${{ vars.HF_SPACE_NAME }}" ]; then
+            echo "❌ Erreur: La variable HF_SPACE_NAME n'est pas configurée !"
+            echo "➡️ Allez dans Settings → Secrets and variables → Actions → New variable"
+            echo "➡️ Nom: HF_SPACE_NAME, Valeur: nom de votre Space"
+            exit 1
+          fi
+          echo "✅ Tous les secrets et variables sont configurés"
+
+      - name: 🏗️ Prepare deployment package
+        run: |
+          # Créer un dossier de déploiement propre
+          DEPLOY_DIR=$(mktemp -d)
+          
+          # Copier les fichiers nécessaires
+          cp -r backend/ "$DEPLOY_DIR/backend"
+          cp -r frontend/ "$DEPLOY_DIR/frontend"
+          cp requirements.txt "$DEPLOY_DIR/"
+          cp Dockerfile "$DEPLOY_DIR/"
+          cp hf_app.py "$DEPLOY_DIR/"
+          cp README.md "$DEPLOY_DIR/"
+          cp docker-compose.yml "$DEPLOY_DIR/"
+          cp run.sh "$DEPLOY_DIR/"
+          chmod +x "$DEPLOY_DIR/run.sh"
+          
+          echo "📦 Déploiement prêt dans: $DEPLOY_DIR"
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> $GITHUB_ENV
+
+      - name: 🚀 Deploy to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ vars.HF_USERNAME }}
+          HF_SPACE_NAME: ${{ vars.HF_SPACE_NAME }}
+          HF_HUB_ENABLE_HF_TRANSFER: 1
+        run: |
+          set -e
+          SPACE_ID="${HF_USERNAME}/${HF_SPACE_NAME}"
+          DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
+          
+          echo "═══════════════════════════════════════════"
+          echo "  🚀 Déploiement sur Hugging Face Spaces"
+          echo "═══════════════════════════════════════════"
+          echo ""
+          echo "  Space ID: ${SPACE_ID}"
+          echo "  Files: $(find "$DEPLOY_DIR" -type f | wc -l)"
+          echo ""
+          
+          # Se connecter à HF
+          echo "🔑 Authentification Hugging Face..."
+          huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+          
+          # Créer le repo Space s'il n'existe pas
+          echo "📋 Vérification/création du Space..."
+          python3 << 'PYEOF'
+          import os
+          from huggingface_hub import HfApi, SpaceStage
+
+          api = HfApi()
+          username = os.environ["HF_USERNAME"]
+          space_name = os.environ["HF_SPACE_NAME"]
+          repo_id = f"{username}/{space_name}"
+
+          try:
+              info = api.space_info(repo_id)
+              print(f"✅ Space existe déjà: {repo_id}")
+              print(f"   SDK: {info.sdk}")
+              print(f"   Stage: {info.stage}")
+          except Exception:
+              print(f"🆕 Création du Space: {repo_id}")
+              api.create_repo(
+                  repo_id=repo_id,
+                  repo_type="space",
+                  space_sdk="docker",
+                  exist_ok=True,
+              )
+              print(f"✅ Space créé: {repo_id}")
+          PYEOF
+          
+          # Uploader tous les fichiers
+          echo "📤 Upload des fichiers..."
+          python3 << 'PYEOF
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi()
+          username = os.environ["HF_USERNAME"]
+          space_name = os.environ["HF_SPACE_NAME"]
+          repo_id = f"{username}/{space_name}"
+          deploy_dir = os.environ["DEPLOY_DIR"]
+
+          result = api.upload_folder(
+              folder_path=deploy_dir,
+              repo_id=repo_id,
+              repo_type="space",
+              ignore_patterns=["__pycache__", "*.pyc", ".env", "*.db", ".git"],
+              commit_message=f"🚀 Deploy from GitHub Actions - {os.environ.get('GITHUB_SHA', 'manual')[:7]}",
+              create_pr=False,
+          )
+          print(f"✅ Upload terminé: {result}")
+          PYEOF
+          
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "  ✅ Déploiement réussi !"
+          echo "═══════════════════════════════════════════"
+          echo ""
+          echo "  🌐 https://huggingface.co/spaces/${SPACE_ID}"
+          echo ""
+          echo "  ⚙️ Post-déploiement :"
+          echo "  1. Allez sur votre Space"
+          echo "  2. Settings → Hardware → Sélectionnez GPU (T4 gratuit ou mieux)"
+          echo "  3. Settings → Secrets → Ajoutez HF_TOKEN si nécessaire"
+          echo "  4. Redémarrez le Space"
+          echo ""
+          echo "═══════════════════════════════════════════"
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          rm -rf "${{ env.DEPLOY_DIR }}" 2>/dev/null || true

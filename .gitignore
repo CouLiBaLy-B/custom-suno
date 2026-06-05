@@ -1,19 +1,60 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
 .venv/
 venv/
+env/
+
+# Distribution / packaging
 dist/
 build/
 *.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (too large for git)
 models/
-storage/*.wav
-storage/*.mp3
+*.bin
+*.pt
+*.ckpt
+*.safetensors
+
+# Storage audio
+storage/
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# Logs
+logs/
 *.log
+
+# Environment (secrets!)
 .env
+.env.local
+.env.production
+
+# Database
 *.db
 *.sqlite3
-.DS_Store
-.env
-musicstudio.db
-storage/
-models/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# HF cache
+.huggingface/
