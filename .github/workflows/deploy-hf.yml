@@ -1,9 +1,10 @@
 # ============================================================
 #  🚀 CI/CD - Déploiement automatique sur Hugging Face Spaces
 # ============================================================
-# Configurer dans Settings → Secrets and variables → Actions:
-#   Secrets:  HF_TOKEN
-#   Variables: HF_USERNAME, HF_SPACE_NAME
+# Secrets/Variables requis dans GitHub Settings → Actions:
+#   Secret:    HF_TOKEN  (token Write de huggingface.co/settings/tokens)
+#   Variable:  HF_USERNAME  (ex: CouLiBaLy-B)
+#   Variable:  HF_SPACE_NAME  (ex: ai-music-studio)
 # ============================================================
 
 name: 🚀 Deploy to Hugging Face Spaces
@@ -21,7 +22,7 @@ jobs:
   deploy:
     name: 🚀 Deploy to HF Spaces
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: 📥 Checkout code
@@ -29,113 +30,92 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Setup Python (minimal)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 📦 Install HF CLI
+      - name: 📦 Install HF CLI uniquement
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet huggingface_hub "huggingface_hub[cli]"
+          pip install --quiet huggingface_hub
 
-      - name: 🔑 Check required secrets
+      - name: 🔑 Vérifier secrets
         run: |
+          missing=0
           if [ -z "${{ secrets.HF_TOKEN }}" ]; then
-            echo "::error::Secret HF_TOKEN manquant! Allez dans Settings → Secrets → New secret"
-            exit 1
+            echo "::error::Secret HF_TOKEN manquant!"
+            missing=1
           fi
           if [ -z "${{ vars.HF_USERNAME }}" ]; then
-            echo "::error::Variable HF_USERNAME manquante! Allez dans Settings → Variables → New variable"
-            exit 1
+            echo "::error::Variable HF_USERNAME manquante!"
+            missing=1
           fi
           if [ -z "${{ vars.HF_SPACE_NAME }}" ]; then
-            echo "::error::Variable HF_SPACE_NAME manquante! Allez dans Settings → Variables → New variable"
+            echo "::error::Variable HF_SPACE_NAME manquante!"
+            missing=1
+          fi
+          if [ "$missing" -eq 1 ]; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  Configuration requise:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  1. Allez dans: Settings → Secrets and variables → Actions"
+            echo "  2. Onglet Secrets → New repository secret:"
+            echo "     Name: HF_TOKEN  |  Value: hf_votre_token"
+            echo "  3. Onglet Variables → New repository variable:"
+            echo "     Name: HF_USERNAME  |  Value: CouLiBaLy-B"
+            echo "     Name: HF_SPACE_NAME |  Value: ai-music-studio"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             exit 1
           fi
-          echo "✅ Secrets OK: HF_USERNAME=${{ vars.HF_USERNAME }}, HF_SPACE_NAME=${{ vars.HF_SPACE_NAME }}"
+          echo "✅ Tous les secrets sont configurés"
 
-      - name: 🚀 Deploy via Python script
+      - name: 🚀 Upload vers Hugging Face Spaces
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_USERNAME: ${{ vars.HF_USERNAME }}
           HF_SPACE_NAME: ${{ vars.HF_SPACE_NAME }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
-          python3 << 'PYEOF'
-          import os
-          import sys
+          python3 - << 'PYEOF'
+          import os, sys
           from pathlib import Path
 
           HF_TOKEN = os.environ["HF_TOKEN"]
           HF_USERNAME = os.environ["HF_USERNAME"]
           HF_SPACE_NAME = os.environ["HF_SPACE_NAME"]
-          GITHUB_SHA = os.environ.get("GITHUB_SHA", "unknown")[:7]
+          SHA = os.environ.get("GITHUB_SHA", "manual")[:7]
           REPO_ID = f"{HF_USERNAME}/{HF_SPACE_NAME}"
 
           print(f"🚀 Déploiement vers: {REPO_ID}")
-          print(f"📁 Répertoire de travail: {os.getcwd()}")
 
-          # Se connecter
           from huggingface_hub import login, HfApi
           login(token=HF_TOKEN, add_to_git_credential=True)
           api = HfApi()
 
-          # Créer le space s'il n'existe pas
+          # Créer le space si besoin
           try:
               info = api.space_info(REPO_ID)
-              print(f"✅ Space existe: {REPO_ID} (SDK: {info.sdk})")
+              print(f"✅ Space existe déjà: {REPO_ID} (SDK: {info.sdk})")
           except Exception:
               print(f"🆕 Création du Space: {REPO_ID}")
-              api.create_repo(
-                  repo_id=REPO_ID,
-                  repo_type="space",
-                  space_sdk="docker",
-              )
+              api.create_repo(repo_id=REPO_ID, repo_type="space", space_sdk="docker")
               print(f"✅ Space créé!")
 
-          # Préparer les fichiers à uploader (exclure les inutiles)
-          project_root = Path(os.getcwd())
-          ignore_patterns = {
-              "__pycache__", ".git", ".github", ".venv",
-              "models", "storage", "logs", "tests",
-              ".env", "*.db", "*.pyc", "node_modules",
-              "generate_project.py", "run.sh", "docker-compose.yml",
-              "DEPLOYMENT.md", ".gitignore",
-          }
-
-          files_to_upload = []
-          for f in project_root.rglob("*"):
-              if f.is_file():
-                  # Vérifier si un parent est dans les patterns à ignorer
-                  skip = False
-                  for part in f.parts:
-                      if part in ignore_patterns:
-                          skip = True
-                          break
-                  for pat in ["*.pyc", "*.db", "*.env"]:
-                      import fnmatch
-                      if fnmatch.fnmatch(f.name, pat):
-                          skip = True
-                          break
-                  if not skip:
-                      files_to_upload.append(f)
-
-          print(f"📤 {len(files_to_upload)} fichiers à uploader")
-
-          # Upload
+          # Uploader tous les fichiers du repo
+          print(f"📤 Upload depuis: {os.getcwd()}")
           result = api.upload_folder(
-              folder_path=str(project_root),
+              folder_path=os.getcwd(),
               repo_id=REPO_ID,
               repo_type="space",
               ignore_patterns=[
                   "__pycache__/**", ".git/**", ".github/**",
-                  ".venv/**", "models/**", "storage/**",
-                  "logs/**", "tests/**", ".env", "*.db",
-                  "*.pyc", "node_modules/**",
+                  ".venv/**", "node_modules/**",
+                  "*.pyc", ".env", "*.db",
                   "generate_project.py",
               ],
-              commit_message=f"🚀 Deploy from GitHub Actions - {GITHUB_SHA}",
+              commit_message=f"🚀 Deploy from GitHub Actions ({SHA})",
               create_pr=False,
           )
 
@@ -143,18 +123,18 @@ jobs:
           print(f"🌐 https://huggingface.co/spaces/{REPO_ID}")
           PYEOF
 
-      - name: 📢 Summary
+      - name: 📢 Résumé
         if: always()
         run: |
           echo ""
-          echo "═══════════════════════════════════════════════"
-          echo "  🎵 AI Music Studio - Déploiement"
-          echo "═══════════════════════════════════════════════"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  🎵 AI Music Studio — Déploiement"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           echo "  🌐 https://huggingface.co/spaces/${{ vars.HF_USERNAME }}/${{ vars.HF_SPACE_NAME }}"
           echo ""
-          echo "  ⚙️ Post-déploiement requis :"
-          echo "  1. Settings → Hardware → T4 Small (gratuit)"
-          echo "  2. Reboot du Space"
+          echo "  ⚙️ Post-déploiement:"
+          echo "  1. Space Settings → Hardware → T4 Small (gratuit)"
+          echo "  2. Space Settings → Rebuild"
           echo ""
-          echo "═══════════════════════════════════════════════"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
