@@ -1,35 +1,27 @@
-"""Configuration centrale - AI Music Studio"""
-from __future__ import annotations
-from functools import lru_cache
+"""Configuration - sans pydantic-settings pour compatibilité HF Spaces"""
+import os
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from dataclasses import dataclass
 
 
-class Settings(BaseSettings):
-    """Paramètres globaux de l'application."""
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
-    )
-
-    host: str = "0.0.0.0"
-    api_port: int = 8000
-    streamlit_port: int = 8501
-    debug: bool = False
-    database_url: str = "sqlite:///./musicstudio.db"
-    celery_broker_url: str = "redis://localhost:6379/0"
-    celery_result_backend: str = "redis://localhost:6379/1"
-    storage_path: str = "./storage"
-    model_cache_dir: str = "./models"
-    device: str = "cuda"
-    use_half_precision: bool = True
-    musicgen_model: str = "facebook/musicgen-small"
-    stable_audio_model: str = "stabilityai/stable-audio-open-1.0"
-    bark_model: str = "suno/bark-small"
-    secret_key: str = "dev-secret-key"
+@dataclass
+class Settings:
+    """Paramètres depuis variables d'environnement."""
+    host: str = os.environ.get("HOST", "0.0.0.0")
+    api_port: int = int(os.environ.get("API_PORT", "8000"))
+    streamlit_port: int = int(os.environ.get("STREAMLIT_PORT", "8501"))
+    debug: bool = os.environ.get("DEBUG", "false").lower() == "true"
+    database_url: str = os.environ.get("DATABASE_URL", "sqlite:///./musicstudio.db")
+    celery_broker_url: str = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
+    celery_result_backend: str = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+    storage_path: str = os.environ.get("STORAGE_PATH", "./storage")
+    model_cache_dir: str = os.environ.get("MODEL_CACHE_DIR", "./models")
+    device: str = os.environ.get("DEVICE", "cpu")  # CPU par défaut pour Spaces
+    use_half_precision: bool = os.environ.get("USE_HALF_PRECISION", "true").lower() == "true"
+    musicgen_model: str = os.environ.get("MUSICGEN_MODEL", "facebook/musicgen-small")
+    stable_audio_model: str = os.environ.get("STABLE_AUDIO_MODEL", "stabilityai/stable-audio-open-1.0")
+    bark_model: str = os.environ.get("BARK_MODEL", "suno/bark-small")
+    secret_key: str = os.environ.get("SECRET_KEY", "dev-secret-key")
 
     @property
     def storage_dir(self) -> Path:
@@ -40,6 +32,10 @@ class Settings(BaseSettings):
         return Path(self.model_cache_dir).resolve()
 
 
-@lru_cache()
+_settings = None
+
 def get_settings() -> Settings:
-    return Settings()
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
