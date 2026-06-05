@@ -1,33 +1,28 @@
 """
-AI Music Studio — Single-process Application pour Hugging Face Spaces
-Architecture : FastAPI sur port 7860 + Streamlit intégré (pas de subprocess)
-Zero problème d'import, zero problème de port, qualité maximale.
+AI Music Studio — Single-file Streamlit App for Hugging Face Spaces
+Architecture : tout dans un seul fichier, appels directs aux services IA.
+Zero subprocess, zero FastAPI séparé, zero problème de port.
 """
 from __future__ import annotations
 
 import os
 import sys
+import json
+import uuid
+import numpy as np
+import soundfile as sf
+import streamlit as st
+from datetime import datetime
+from typing import Optional
+from contextlib import contextmanager
 
-# ── CRITIQUE : sys.path en TOUT premier ──
+# ── sys.path ──
 app_dir = os.path.dirname(os.path.abspath(__file__))
 if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
 os.chdir(app_dir)
 
-import asyncio
-import json
-import uuid
-import threading
-from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
-from typing import Optional, Callable
-
-import numpy as np
-import soundfile as sf
-from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
+# ── SQLAlchemy imports ──
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 
@@ -36,9 +31,6 @@ from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 # ═══════════════════════════════════════════════════════
 
 class Settings:
-    host: str = os.environ.get("HOST", "0.0.0.0")
-    port: int = int(os.environ.get("PORT", "7860"))
-    debug: bool = os.environ.get("DEBUG", "false").lower() == "true"
     database_url: str = os.environ.get("DATABASE_URL", "sqlite:///./musicstudio.db")
     storage_path: str = os.environ.get("STORAGE_PATH", "./storage")
     model_cache_dir: str = os.environ.get("MODEL_CACHE_DIR", "./models")
@@ -47,20 +39,23 @@ class Settings:
     musicgen_model: str = os.environ.get("MUSICGEN_MODEL", "facebook/musicgen-small")
     stable_audio_model: str = os.environ.get("STABLE_AUDIO_MODEL", "stabilityai/stable-audio-open-1.0")
     bark_model: str = os.environ.get("BARK_MODEL", "suno/bark-small")
-    secret_key: str = os.environ.get("SECRET_KEY", "dev-secret-key")
 
     @property
     def storage_dir(self):
-        return os.path.abspath(self.storage_path)
+        d = os.path.abspath(self.storage_path)
+        os.makedirs(d, exist_ok=True)
+        return d
 
     @property
     def model_dir(self):
-        return os.path.abspath(self.model_cache_dir)
+        d = os.path.abspath(self.model_cache_dir)
+        os.makedirs(d, exist_ok=True)
+        return d
 
 settings = Settings()
 
 # ═══════════════════════════════════════════════════════
-#  DATABASE
+#  DATABASE (SQLite local)
 # ═══════════════════════════════════════════════════════
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
@@ -69,15 +64,8 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 class Base(DeclarativeBase):
     pass
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 @contextmanager
-def get_db_context():
+def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -103,8 +91,6 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    projects = relationship("Project", back_populates="owner", cascade="all, delete-orphan")
-    generations = relationship("Generation", back_populates="user", cascade="all, delete-orphan")
 
 class Project(Base):
     __tablename__ = "projects"
@@ -113,9 +99,6 @@ class Project(Base):
     name = Column(String(255), default="Nouveau projet")
     description = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    owner = relationship("User", back_populates="projects")
-    generations = relationship("Generation", back_populates="project", cascade="all, delete-orphan")
 
 class Generation(Base):
     __tablename__ = "generations"
@@ -134,80 +117,12 @@ class Generation(Base):
     audio_duration = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
-    project = relationship("Project", back_populates="generations")
-    user = relationship("User", back_populates="generations")
 
 # ═══════════════════════════════════════════════════════
-#  PYDANTIC SCHEMAS
+#  AI SERVICES (lazy, thread-safe)
 # ═══════════════════════════════════════════════════════
 
-class GenerationRequest(BaseModel):
-    model_name: str = Field("musicgen")
-    prompt: str = Field(..., min_length=1, max_length=1000)
-    negative_prompt: Optional[str] = None
-    duration: int = Field(15, ge=3, le=300)
-    temperature: float = Field(1.0, ge=0.1, le=2.0)
-    top_k: int = Field(250, ge=1, le=1000)
-    top_p: float = Field(0.0, ge=0.0, le=1.0)
-    cfg_coef: float = Field(3.0, ge=0.0, le=10.0)
-    num_variations: int = Field(1, ge=1, le=4)
-    seed: int = Field(-1)
-    genre_tags: Optional[str] = None
-    lyrics: Optional[str] = None
-    project_id: Optional[str] = None
-
-class GenerationResponse(BaseModel):
-    task_id: str
-    status: str = "pending"
-    estimated_time_seconds: int = 60
-    message: str = "Génération lancée"
-
-class GenerationStatus(BaseModel):
-    task_id: str
-    status: str
-    progress: int = 0
-    current_step: Optional[str] = None
-    eta: Optional[int] = None
-    result: Optional[dict] = None
-    error: Optional[str] = None
-
-class ProjectCreate(BaseModel):
-    name: str = "Nouveau projet"
-    description: str = ""
-
-class ProjectResponse(BaseModel):
-    id: str
-    name: str
-    description: str
-    created_at: str
-    generations: list = []
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-class UserResponse(BaseModel):
-    id: str
-    username: str
-    email: str
-
-# ═══════════════════════════════════════════════════════
-#  TASK STORE (in-memory)
-# ═══════════════════════════════════════════════════════
-
-_task_store: dict[str, dict] = {}
-
-def _update_task(task_id: str, **kwargs):
-    if task_id in _task_store:
-        _task_store[task_id].update(kwargs)
-
-# ═══════════════════════════════════════════════════════
-#  AI SERVICES (lazy import, thread-safe)
-# ═══════════════════════════════════════════════════════
+import threading
 
 class MusicGenService:
     _instance = None
@@ -234,12 +149,12 @@ class MusicGenService:
             if self._model is not None:
                 return
             import torch
-            print(f"📥 Loading MusicGen: {settings.musicgen_model}")
+            st.toast(f"📥 Chargement MusicGen: {settings.musicgen_model}", icon="⏳")
             try:
                 from audiocraft.models import MusicGen as MC
                 self._model = MC.get_pretrained(settings.musicgen_model)
                 self._model = self._model.to(self.device)
-                print("✅ MusicGen loaded via audiocraft")
+                st.toast("✅ MusicGen chargé (audiocraft)", icon="🎸")
             except ImportError:
                 from transformers import AutoProcessor, MusicgenForConditionalGeneration
                 dtype = torch.float16 if self.device == "cuda" and settings.use_half_precision else torch.float32
@@ -248,18 +163,15 @@ class MusicGenService:
                     settings.musicgen_model, torch_dtype=dtype
                 )
                 self._model = self._model.to(self.device)
-                print("✅ MusicGen loaded via transformers")
+                st.toast("✅ MusicGen chargé (transformers)", icon="🎸")
 
-    async def generate(self, prompt: str, duration: int = 15, temperature: float = 1.0,
-                       top_k: int = 250, top_p: float = 0.0, cfg_coef: float = 3.0,
-                       num_variations: int = 1, seed: int = -1,
-                       progress_callback: Optional[Callable[[int], None]] = None):
+    def generate(self, prompt: str, duration: int = 15, temperature: float = 1.0,
+                 top_k: int = 250, top_p: float = 0.0, cfg_coef: float = 3.0,
+                 num_variations: int = 1, seed: int = -1):
         import torch
         self.load_model()
-        if progress_callback: progress_callback(20)
         if seed >= 0:
             torch.manual_seed(seed)
-        if progress_callback: progress_callback(40)
         print(f"🎸 Generating: '{prompt[:50]}...' ({duration}s)")
         if hasattr(self._model, 'set_generation_params'):
             self._model.set_generation_params(
@@ -278,7 +190,6 @@ class MusicGenService:
             )
             audio = audio_values.cpu().numpy()
             sample_rate = self._model.config.audio_encoder_sample_rate
-        if progress_callback: progress_callback(100)
         print(f"✅ MusicGen done: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate
 
@@ -307,33 +218,29 @@ class StableAudioService:
             if self._pipeline is not None:
                 return
             import torch
-            print(f"📥 Loading Stable Audio: {settings.stable_audio_model}")
+            st.toast(f"📥 Chargement Stable Audio...", icon="⏳")
             from diffusers import StableAudioPipeline
             dtype = torch.float16 if self.device == "cuda" else torch.float32
             self._pipeline = StableAudioPipeline.from_pretrained(
                 settings.stable_audio_model, torch_dtype=dtype
             )
             self._pipeline = self._pipeline.to(self.device)
-            print("✅ Stable Audio loaded")
+            st.toast("✅ Stable Audio chargé", icon="🔊")
 
-    async def generate(self, prompt: str, negative_prompt: str = None,
-                       duration: float = 30.0, num_variations: int = 1,
-                       seed: int = -1, progress_callback: Optional[Callable[[int], None]] = None):
+    def generate(self, prompt: str, negative_prompt: str = None,
+                 duration: float = 30.0, num_variations: int = 1,
+                 seed: int = -1):
         import torch
         self.load_pipeline()
-        if progress_callback: progress_callback(20)
         generator = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
-        if progress_callback: progress_callback(40)
         print(f"🔊 Generating: '{prompt[:50]}...' ({duration}s)")
         result = self._pipeline(
             prompt=prompt, negative_prompt=negative_prompt or "",
             num_inference_steps=200, audio_end_in_s=min(duration, 47.0),
             num_waveforms_per_prompt=num_variations, generator=generator,
         )
-        if progress_callback: progress_callback(90)
         audio = result.audios[0].cpu().numpy() if num_variations == 1 else result.audios.cpu().numpy()
         sample_rate = self._pipeline.vae.sampling_rate
-        if progress_callback: progress_callback(100)
         print(f"✅ Stable Audio done: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate
 
@@ -362,21 +269,19 @@ class BarkService:
         with self._lock:
             if self._model is not None:
                 return
-            print(f"📥 Loading Bark: {settings.bark_model}")
+            st.toast(f"📥 Chargement Bark...", icon="⏳")
             from transformers import AutoProcessor, BarkModel
             self._processor = AutoProcessor.from_pretrained(settings.bark_model)
             self._model = BarkModel.from_pretrained(settings.bark_model)
             self._model = self._model.to(self.device)
-            print("✅ Bark loaded")
+            st.toast("✅ Bark chargé", icon="🗣️")
 
-    async def generate(self, text: str, voice_preset: str = "v2/fr_speaker_1",
-                       duration: int = None, num_variations: int = 1,
-                       seed: int = -1, progress_callback: Optional[Callable[[int], None]] = None):
+    def generate(self, text: str, voice_preset: str = "v2/fr_speaker_1",
+                 duration: int = None, num_variations: int = 1,
+                 seed: int = -1):
         import torch
         self.load_model()
-        if progress_callback: progress_callback(20)
         inputs = self._processor(text=text, voice_preset=voice_preset)
-        if progress_callback: progress_callback(40)
         print(f"🗣️ Generating: '{text[:50]}...'")
         audios = []
         for i in range(num_variations):
@@ -387,327 +292,311 @@ class BarkService:
                 do_sample=True,
             )
             audios.append(audio.cpu().numpy())
-        if progress_callback: progress_callback(90)
         sample_rate = 24000
         result = audios[0] if num_variations == 1 else np.concatenate(audios, axis=-1)
-        if progress_callback: progress_callback(100)
         print(f"✅ Bark done: shape={result.shape}, sr={sample_rate}")
         return result, sample_rate
 
 # ═══════════════════════════════════════════════════════
-#  FASTAPI APPLICATION (sur port 7860)
+#  SAVE & LOAD HELPERS
 # ═══════════════════════════════════════════════════════
 
-@asynccontextmanager
-async def lifespan(fastapi_app: FastAPI):
-    os.makedirs(settings.storage_dir, exist_ok=True)
-    os.makedirs(settings.model_dir, exist_ok=True)
-    init_db()
-    print("✅ AI Music Studio API démarrée sur le port 7860")
-    yield
-    print("🛑 AI Music Studio API arrêtée")
-
-api_app = FastAPI(
-    title="AI Music Studio",
-    description="Plateforme open source de génération musicale par IA",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-api_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── API Endpoints ──
-
-@api_app.post("/api/generate", response_model=GenerationResponse)
-async def generate_music(
-    request: GenerationRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
+def save_audio(audio_data, sample_rate: int) -> str:
+    """Sauvegarde l'audio et retourne le chemin du fichier."""
+    audio_np = audio_data.cpu().numpy() if hasattr(audio_data, 'cpu') else np.array(audio_data)
+    if audio_np.ndim == 1:
+        audio_np = audio_np.reshape(1, -1)
     task_id = str(uuid.uuid4())
-    gen = Generation(
-        id=task_id, project_id=request.project_id, user_id="anonymous",
-        model_name=request.model_name, prompt=request.prompt,
-        negative_prompt=request.negative_prompt, genre_tags=request.genre_tags,
-        lyrics=request.lyrics,
-        parameters=json.dumps({
-            "duration": request.duration, "temperature": request.temperature,
-            "top_k": request.top_k, "top_p": request.top_p,
-            "cfg_coef": request.cfg_coef, "seed": request.seed,
-            "num_variations": request.num_variations,
-        }),
-        status="pending", created_at=datetime.utcnow(),
-    )
-    db.add(gen)
-    db.commit()
-    _task_store[task_id] = {
-        "task_id": task_id, "status": "pending", "progress": 0,
-        "created_at": datetime.utcnow().isoformat(),
+    file_path = os.path.join(settings.storage_dir, f"{task_id}.wav")
+    sf.write(file_path, audio_np.T, sample_rate)
+    duration_sec = audio_np.shape[-1] / sample_rate
+    return file_path, task_id, duration_sec
+
+def save_generation_to_db(model_name: str, prompt: str, status: str,
+                          audio_url: str = None, duration: float = None,
+                          error: str = None):
+    """Enregistre la génération dans la base de données."""
+    try:
+        with get_db() as db:
+            gen = Generation(
+                id=str(uuid.uuid4()),
+                user_id="anonymous",
+                model_name=model_name,
+                prompt=prompt,
+                status=status,
+                audio_url=audio_url,
+                audio_duration=duration,
+                error_message=error,
+                created_at=datetime.utcnow(),
+                completed_at=datetime.utcnow() if status != "pending" else None,
+            )
+            db.add(gen)
+    except Exception as e:
+        print(f"⚠️ Erreur sauvegarde DB: {e}")
+
+def get_generations_from_db(limit: int = 20):
+    """Récupère l'historique des générations."""
+    try:
+        with get_db() as db:
+            from sqlalchemy import desc
+            return db.query(Generation).order_by(desc(Generation.created_at)).limit(limit).all()
+    except Exception:
+        return []
+
+# ═══════════════════════════════════════════════════════
+#  STREAMLIT UI
+# ═══════════════════════════════════════════════════════
+
+# Init DB
+init_db()
+os.makedirs(settings.storage_dir, exist_ok=True)
+os.makedirs(settings.model_dir, exist_ok=True)
+
+# ─── CSS ───
+st.markdown("""
+<style>
+    .stApp {
+        background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
     }
-    background_tasks.add_task(_run_generation, task_id=task_id, request=request)
-    return GenerationResponse(
-        task_id=task_id, estimated_time_seconds=request.duration * 2,
-        message=f"Génération '{request.model_name}' lancée: '{request.prompt[:50]}...'",
-    )
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 800;
+        background: linear-gradient(90deg, #ff6b6b, #feca57, #48dbfb, #ff9ff3);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    .stButton > button {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 1.1rem;
+        padding: 0.75rem 2rem;
+        border: none;
+        border-radius: 25px;
+        width: 100%;
+    }
+    .status-badge {
+        display: inline-block;
+        padding: 5px 15px;
+        border-radius: 20px;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-@api_app.get("/api/generate/{task_id}", response_model=GenerationStatus)
-async def get_status(task_id: str):
-    if task_id not in _task_store:
-        raise HTTPException(status_code=404, detail="Tâche non trouvée")
-    task = _task_store[task_id]
-    status = task["status"]
-    resp = GenerationStatus(
-        task_id=task_id, status=status,
-        progress=task.get("progress", 0),
-        current_step=task.get("current_step"),
-    )
-    if status == "completed":
-        resp.result = {
-            "task_id": task_id,
-            "audio_url": task.get("audio_url"),
-            "audio_duration": task.get("audio_duration"),
+# ─── Header ───
+st.markdown('<h1 class="main-header">🎵 AI Music Studio</h1>', unsafe_allow_html=True)
+st.caption("Génération musicale IA open source — MusicGen · Stable Audio · Bark")
+
+# ─── Sidebar ───
+page = st.sidebar.radio("🎛️ Module", [
+    "🎸 MusicGen",
+    "🔊 Stable Audio",
+    "🗣️ Bark",
+    "📚 Bibliothèque",
+])
+
+# ═══════════════════════════════════════════════════════
+#  PAGE: MusicGen
+# ═══════════════════════════════════════════════════════
+if page == "🎸 MusicGen":
+    st.header("🎸 Génération Instrumentale (MusicGen)")
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        prompt = st.text_area(
+            "🎼 Décrivez votre musique",
+            placeholder="epic orchestral battle music with dramatic strings",
+            height=100,
+        )
+
+        st.markdown("### 💡 Prompts d'inspiration")
+        presets = {
+            "🎻 Orchestral": "epic orchestral battle music",
+            "🎸 Rock": "rock with guitars and drums",
+            "🎹 Piano": "calm piano melody",
+            "🎧 Electro": "electronic dance music",
         }
-    elif status == "failed":
-        resp.error = task.get("error", "Erreur inconnue")
-    return resp
+        cols = st.columns(4)
+        for i, (label, text) in enumerate(presets.items()):
+            with cols[i]:
+                if st.button(label, use_container_width=True):
+                    prompt = text
+                    st.rerun()
 
-@api_app.get("/api/audio/{filename}")
-async def get_audio(filename: str):
-    file_path = os.path.join(settings.storage_dir, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Fichier non trouvé")
-    return FileResponse(file_path, media_type="audio/wav")
+    with c2:
+        st.subheader("⚙️ Paramètres")
+        dur = st.slider("Durée (s)", 3, 30, 15)
+        temp = st.slider("Créativité", 0.1, 2.0, 1.0, 0.1)
+        nvar = st.slider("Variations", 1, 4, 1)
+        seed = st.number_input("Seed (-1 = aléatoire)", -1, 99999, -1)
 
-@api_app.websocket("/ws/generation/{task_id}")
-async def ws_progress(websocket: WebSocket, task_id: str):
-    await websocket.accept()
-    try:
-        while True:
-            if task_id not in _task_store:
-                await websocket.send_json({"error": "Tâche introuvable"})
-                break
-            task = _task_store[task_id]
-            await websocket.send_json({
-                "task_id": task_id, "status": task["status"],
-                "progress": task.get("progress", 0),
-                "current_step": task.get("current_step"),
-            })
-            if task["status"] in ("completed", "failed"):
-                break
-            await asyncio.sleep(1)
-    except WebSocketDisconnect:
-        pass
+    st.markdown("---")
+    if st.button("🎵 Générer (MusicGen)", type="primary", use_container_width=True):
+        if prompt:
+            with st.spinner("🎵 Chargement du modèle et génération..."):
+                try:
+                    svc = MusicGenService()
+                    audio, sr = svc.generate(
+                        prompt=prompt, duration=dur, temperature=temp,
+                        top_k=250, top_p=0.0, cfg_coef=3.0,
+                        num_variations=nvar, seed=seed,
+                    )
+                    file_path, task_id, duration_sec = save_audio(audio, sr)
+                    save_generation_to_db("musicgen", prompt, "completed",
+                                          audio_url=f"/api/audio/{task_id}.wav",
+                                          duration=duration_sec)
 
-@api_app.get("/api/projects", response_model=list[ProjectResponse])
-async def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(Project).all()
-    return [
-        ProjectResponse(
-            id=p.id, name=p.name, description=p.description,
-            created_at=p.created_at.isoformat(),
-        )
-        for p in projects
-    ]
-
-@api_app.post("/api/projects", response_model=ProjectResponse)
-async def create_project(proj: ProjectCreate, db: Session = Depends(get_db)):
-    new_proj = Project(
-        id=str(uuid.uuid4()), owner_id="anonymous",
-        name=proj.name, description=proj.description,
-        created_at=datetime.utcnow(),
-    )
-    db.add(new_proj)
-    db.commit()
-    db.refresh(new_proj)
-    return ProjectResponse(
-        id=new_proj.id, name=new_proj.name,
-        description=new_proj.description,
-        created_at=new_proj.created_at.isoformat(),
-    )
-
-@api_app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "AI Music Studio", "version": "0.1.0"}
-
-@api_app.post("/api/auth/login", response_model=TokenResponse)
-async def login(creds: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == creds.username).first()
-    if not user:
-        user = User(
-            id=str(uuid.uuid4()), username=creds.username,
-            email=f"{creds.username}@example.com",
-            hashed_password=creds.password,
-            created_at=datetime.utcnow(),
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return TokenResponse(access_token=str(uuid.uuid4()))
-
-@api_app.get("/api/auth/me", response_model=UserResponse)
-async def get_me():
-    return UserResponse(id="anon", username="anonymous", email="anon@example.com")
-
-# ── Catch-all route : sert le frontend Streamlit ──
-
-def _run_streamlit_server():
-    """Lance le serveur Streamlit dans un thread séparé."""
-    import streamlit.web.bootstrap as bootstrap
-    from streamlit.web.server import Server as StreamlitServer
-    from streamlit import config as _config
-    
-    frontend_file = os.path.join(app_dir, "frontend", "app.py")
-    if not os.path.exists(frontend_file):
-        print(f"⚠️ Frontend non trouvé: {frontend_file}")
-        return
-    
-    print(f"🎨 Lancement de Streamlit depuis: {frontend_file}")
-    
-    # Configurer Streamlit pour utiliser le port 7861 (interne)
-    _config.set_option("server.port", 7861)
-    _config.set_option("server.address", "127.0.0.1")
-    _config.set_option("server.headless", True)
-    _config.set_option("browser.gatherUsageStats", False)
-    
-    try:
-        bootstrap.run(frontend_file, "", [], flag_options={})
-    except Exception as e:
-        print(f"⚠️ Erreur Streamlit: {e}")
-
-# ── Route pour servir le frontend ──
-# On utilise un proxy inverse ou on redirige vers Streamlit
-# La solution la plus simple : servir un HTML qui charge Streamlit en iframe
-
-FRONTEND_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>AI Music Studio</title>
-    <style>
-        body { margin: 0; padding: 0; overflow: hidden; }
-        iframe { width: 100vw; height: 100vh; border: none; }
-    </style>
-</head>
-<body>
-    <iframe src="http://127.0.0.1:7861/" title="AI Music Studio"></iframe>
-</body>
-</html>
-"""
-
-@api_app.get("/")
-async def root():
-    return HTMLResponse(content=FRONTEND_HTML)
-
-@api_app.get("/{full_path:path}")
-async def catch_all(full_path: str):
-    # Ne pas intercepter les routes API
-    if full_path.startswith("api/") or full_path.startswith("ws/"):
-        raise HTTPException(status_code=404)
-    return HTMLResponse(content=FRONTEND_HTML)
-
-# ═══════════════════════════════════════════════════════
-#  BACKGROUND GENERATION WORKER
-# ═══════════════════════════════════════════════════════
-
-async def _run_generation(task_id: str, request: GenerationRequest):
-    """Exécute la génération en arrière-plan."""
-    _update_task(task_id, status="processing", progress=10)
-    try:
-        if request.model_name == "musicgen":
-            audio, sr = await MusicGenService().generate(
-                prompt=request.prompt, duration=request.duration,
-                temperature=request.temperature, top_k=request.top_k,
-                top_p=request.top_p, cfg_coef=request.cfg_coef,
-                num_variations=request.num_variations, seed=request.seed,
-                progress_callback=lambda p: _update_task(task_id, progress=p),
-            )
-        elif request.model_name == "stable_audio":
-            audio, sr = await StableAudioService().generate(
-                prompt=request.prompt, negative_prompt=request.negative_prompt,
-                duration=request.duration, num_variations=request.num_variations,
-                seed=request.seed,
-                progress_callback=lambda p: _update_task(task_id, progress=p),
-            )
-        elif request.model_name == "bark":
-            audio, sr = await BarkService().generate(
-                text=request.prompt, duration=request.duration,
-                num_variations=request.num_variations, seed=request.seed,
-                progress_callback=lambda p: _update_task(task_id, progress=p),
-            )
+                    st.success(f"✅ Généré ! ({duration_sec:.1f}s, {sr}Hz)")
+                    st.audio(file_path, format="audio/wav")
+                    with open(file_path, "rb") as f:
+                        st.download_button("💾 Télécharger WAV", data=f,
+                                          file_name=f"{task_id}.wav", mime="audio/wav")
+                except Exception as e:
+                    st.error(f"❌ Erreur: {e}")
+                    save_generation_to_db("musicgen", prompt, "failed", error=str(e))
         else:
-            raise ValueError(f"Modèle inconnu: {request.model_name}")
+            st.error("❌ Entrez une description pour votre musique.")
 
-        # Sauvegarder l'audio
-        audio_np = audio.cpu().numpy() if hasattr(audio, 'cpu') else np.array(audio)
-        if audio_np.ndim == 1:
-            audio_np = audio_np.reshape(1, -1)
+# ═══════════════════════════════════════════════════════
+#  PAGE: Stable Audio
+# ═══════════════════════════════════════════════════════
+elif page == "🔊 Stable Audio":
+    st.header("🔊 Effets Sonores (Stable Audio Open)")
+    c1, c2 = st.columns([2, 1])
 
-        file_path = os.path.join(settings.storage_dir, f"{task_id}.wav")
-        sf.write(file_path, audio_np.T, sr)
-        duration_sec = audio_np.shape[-1] / sr
+    with c1:
+        prompt = st.text_area(
+            "🎼 Décrivez le son",
+            placeholder="warm analog synthesizer arpeggio with reverb",
+            height=100,
+        )
+        neg = st.text_area("🚫 Negative prompt", placeholder="low quality, distorted", height=60)
 
-        with get_db_context() as db:
-            gen = db.query(Generation).filter(Generation.id == task_id).first()
-            if gen:
-                gen.status = "completed"
-                gen.audio_url = f"/api/audio/{task_id}.wav"
-                gen.audio_duration = duration_sec
-                gen.completed_at = datetime.utcnow()
-                db.commit()
+        st.markdown("### 💡 Exemples")
+        examples = {
+            "🥁 Beat": "hard hitting trap drum beat with 808 bass",
+            "🎸 Guitare": "distorted electric guitar riff in D minor",
+            "🌊 Ambient": "ocean waves with soft synthesizer pads",
+            "🎹 Piano": "classical piano melody with soft reverb",
+        }
+        cols = st.columns(4)
+        for i, (label, text) in enumerate(examples.items()):
+            with cols[i]:
+                if st.button(label, use_container_width=True):
+                    prompt = text
+                    st.rerun()
 
-        _update_task(
-            task_id, status="completed", progress=100,
-            audio_url=f"/api/audio/{task_id}.wav",
-            audio_duration=duration_sec,
-            completed_at=datetime.utcnow().isoformat(),
+    with c2:
+        st.subheader("⚙️ Paramètres")
+        dur = st.slider("Durée (s)", 1, 47, 10)
+        nvar = st.slider("Variations", 1, 4, 1)
+        seed = st.number_input("Seed (-1 = aléatoire)", -1, 99999, -1, key="sa_seed")
+
+    st.markdown("---")
+    if st.button("🔊 Générer (Stable Audio)", type="primary", use_container_width=True):
+        if prompt:
+            with st.spinner("🔊 Génération en cours..."):
+                try:
+                    svc = StableAudioService()
+                    audio, sr = svc.generate(
+                        prompt=prompt, negative_prompt=neg, duration=dur,
+                        num_variations=nvar, seed=seed,
+                    )
+                    file_path, task_id, duration_sec = save_audio(audio, sr)
+                    save_generation_to_db("stable_audio", prompt, "completed",
+                                          audio_url=f"/api/audio/{task_id}.wav",
+                                          duration=duration_sec)
+                    st.success(f"✅ Généré ! ({duration_sec:.1f}s, {sr}Hz)")
+                    st.audio(file_path, format="audio/wav")
+                    with open(file_path, "rb") as f:
+                        st.download_button("💾 Télécharger WAV", data=f,
+                                          file_name=f"{task_id}.wav", mime="audio/wav")
+                except Exception as e:
+                    st.error(f"❌ Erreur: {e}")
+                    save_generation_to_db("stable_audio", prompt, "failed", error=str(e))
+        else:
+            st.error("❌ Entrez une description pour le son.")
+
+# ═══════════════════════════════════════════════════════
+#  PAGE: Bark
+# ═══════════════════════════════════════════════════════
+elif page == "🗣️ Bark":
+    st.header("🗣️ Voix & Jingles (Bark)")
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        text = st.text_area(
+            "📝 Texte ou paroles",
+            placeholder="♪ La la la, c'est ma chanson ♪\n\nUtilisez ♪ autour des paroles pour le chant",
+            height=150,
         )
 
-    except Exception as e:
-        print(f"Échec génération {task_id}: {e}")
-        _update_task(task_id, status="failed", error=str(e))
-        with get_db_context() as db:
-            gen = db.query(Generation).filter(Generation.id == task_id).first()
-            if gen:
-                gen.status = "failed"
-                gen.error_message = str(e)
-                gen.completed_at = datetime.utcnow()
-                db.commit()
+    with c2:
+        st.subheader("⚙️ Paramètres")
+        voice = st.selectbox(
+            "Voix",
+            ["v2/fr_speaker_1", "v2/fr_speaker_2", "v2/en_speaker_1",
+             "v2/en_speaker_2", "v2/de_speaker_1", "v2/es_speaker_1"],
+        )
+        nvar = st.slider("Variations", 1, 4, 1)
+        seed = st.number_input("Seed (-1 = aléatoire)", -1, 99999, -1, key="bark_seed")
+
+    st.markdown("---")
+    if st.button("🗣️ Générer (Bark)", type="primary", use_container_width=True):
+        if text:
+            with st.spinner("🗣️ Génération vocale en cours..."):
+                try:
+                    svc = BarkService()
+                    audio, sr = svc.generate(
+                        text=text, voice_preset=voice, num_variations=nvar, seed=seed,
+                    )
+                    file_path, task_id, duration_sec = save_audio(audio, sr)
+                    save_generation_to_db("bark", text, "completed",
+                                          audio_url=f"/api/audio/{task_id}.wav",
+                                          duration=duration_sec)
+                    st.success(f"✅ Généré ! ({duration_sec:.1f}s, {sr}Hz)")
+                    st.audio(file_path, format="audio/wav")
+                    with open(file_path, "rb") as f:
+                        st.download_button("💾 Télécharger WAV", data=f,
+                                          file_name=f"{task_id}.wav", mime="audio/wav")
+                except Exception as e:
+                    st.error(f"❌ Erreur: {e}")
+                    save_generation_to_db("bark", text, "failed", error=str(e))
+        else:
+            st.error("❌ Entrez du texte ou des paroles.")
 
 # ═══════════════════════════════════════════════════════
-#  ENTRY POINT
+#  PAGE: Bibliothèque
 # ═══════════════════════════════════════════════════════
+elif page == "📚 Bibliothèque":
+    st.header("📚 Bibliothèque de Générations")
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    print("=" * 50)
-    print("  🎵 AI Music Studio - HF Spaces")
-    print("=" * 50)
-    print(f"  App directory: {app_dir}")
-    print(f"  Python: {sys.version}")
-    print(f"  Device: {settings.device}")
-    print(f"  Port: {settings.port}")
-    print("=" * 50)
-    
-    # Lancer Streamlit dans un thread daemon
-    streamlit_thread = threading.Thread(target=_run_streamlit_server, daemon=True)
-    streamlit_thread.start()
-    
-    # Attendre que Streamlit démarre
-    import time
-    time.sleep(3)
-    
-    # Lancer FastAPI sur le port principal (7860)
-    print(f"🚀 Démarrage de FastAPI sur 0.0.0.0:{settings.port}")
-    uvicorn.run(
-        "app:api_app",
-        host="0.0.0.0",
-        port=settings.port,
-        log_level="info",
-    )
+    generations = get_generations_from_db()
+    if generations:
+        for gen in generations:
+            with st.container():
+                cols = st.columns([1, 3, 1, 1])
+                status_icon = {"completed": "✅", "failed": "❌", "pending": "⏳"}.get(gen.status, "⏳")
+                with cols[0]:
+                    st.markdown(f"{status_icon} **{gen.model_name}**")
+                with cols[1]:
+                    st.caption(f"`{gen.prompt[:60]}...`" if len(gen.prompt) > 60 else f"`{gen.prompt}`")
+                with cols[2]:
+                    if gen.audio_duration:
+                        st.caption(f"⏱ {gen.audio_duration:.1f}s")
+                with cols[3]:
+                    if gen.status == "completed" and gen.audio_url:
+                        task_id = gen.audio_url.split("/")[-1].replace(".wav", "")
+                        file_path = os.path.join(settings.storage_dir, f"{task_id}.wav")
+                        if os.path.exists(file_path):
+                            st.audio(file_path, format="audio/wav")
+            st.divider()
+    else:
+        st.info("📂 Aucune génération enregistrée. Commencez par créer de la musique !")
+
+# ─── Footer ───
+st.markdown("---")
+st.caption(f"🎵 **AI Music Studio** v0.1.0 | Device: {settings.device} | Storage: {settings.storage_dir}")
