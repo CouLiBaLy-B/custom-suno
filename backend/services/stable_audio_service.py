@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
-from loguru import logger
+# logger = print  # replaced with print
 from backend.core.config import get_settings
 
 settings = get_settings()
@@ -34,14 +34,14 @@ class StableAudioService:
         if self._pipeline is not None:
             return
 
-        logger.info(f"Chargement Stable Audio: {settings.stable_audio_model}")
+        print(f"Chargement Stable Audio: {settings.stable_audio_model}")
         from diffusers import StableAudioPipeline
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         self._pipeline = StableAudioPipeline.from_pretrained(
             settings.stable_audio_model, torch_dtype=dtype
         )
         self._pipeline = self._pipeline.to(self.device)
-        logger.info("✅ Stable Audio chargé")
+        print("✅ Stable Audio chargé")
 
     async def generate(
         self,
@@ -64,7 +64,7 @@ class StableAudioService:
         if progress_callback:
             progress_callback(40)
 
-        logger.info(f"Génération Stable Audio: '{prompt[:50]}...' ({duration}s)")
+        print(f"Génération Stable Audio: '{prompt[:50]}...' ({duration}s)")
 
         result = self._pipeline(
             prompt=prompt,
@@ -84,5 +84,5 @@ class StableAudioService:
         if progress_callback:
             progress_callback(100)
 
-        logger.info(f"✅ Stable Audio terminé: shape={audio.shape}, sr={sample_rate}")
+        print(f"✅ Stable Audio terminé: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate

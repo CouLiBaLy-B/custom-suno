@@ -13,7 +13,7 @@ import uuid
 import numpy as np
 import soundfile as sf
 import streamlit as st
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
 import threading
@@ -193,7 +193,7 @@ class MusicGenService:
                 do_sample=True, temperature=temperature, top_k=top_k, top_p=top_p,
             )
             audio = audio_values.cpu().numpy()
-            sample_rate = self._model.config.sampling_rate
+            sample_rate = self._model.config.audio_encoder_sample_rate
         print(f"✅ MusicGen done: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate
 
@@ -307,29 +307,13 @@ class BarkService:
 # ═══════════════════════════════════════════════════════════════
 
 def save_audio(audio_data, sample_rate: int) -> tuple:
-    """Sauvegarde l'audio et retourne (file_path, task_id, duration_sec).
-    Gère toutes les shapes: (samples,), (1, samples), (1, 1, samples), etc.
-    """
+    """Sauvegarde l'audio et retourne (file_path, task_id, duration_sec)."""
     audio_np = audio_data.cpu().numpy() if hasattr(audio_data, 'cpu') else np.array(audio_data)
-    
-    # Squeeze toutes les dimensions de taille 1
-    audio_np = np.squeeze(audio_np)
-    
-    # Si toujours 2D (stereo): (channels, samples) ou (samples, channels)
-    if audio_np.ndim == 2:
-        # S'assurer que c'est (samples, channels) pour soundfile
-        if audio_np.shape[0] < audio_np.shape[1]:
-            audio_np = audio_np.T
-    elif audio_np.ndim == 1:
-        # Mono: (samples,)
-        pass
-    else:
-        # Fallback: flatten
-        audio_np = audio_np.flatten()
-    
+    if audio_np.ndim == 1:
+        audio_np = audio_np.reshape(1, -1)
     task_id = str(uuid.uuid4())
     file_path = os.path.join(settings.storage_dir, f"{task_id}.wav")
-    sf.write(file_path, audio_np, sample_rate)
+    sf.write(file_path, audio_np.T, sample_rate)
     duration_sec = audio_np.shape[-1] / sample_rate
     return file_path, task_id, duration_sec
 
@@ -349,8 +333,8 @@ def save_generation_to_db(model_name: str, prompt: str, status: str,
                 audio_url=audio_url,
                 audio_duration=duration,
                 error_message=error,
-                created_at=datetime.now(timezone.utc),
-                completed_at=datetime.now(timezone.utc) if status != "pending" else None,
+                created_at=datetime.utcnow(),
+                completed_at=datetime.utcnow() if status != "pending" else None,
             )
             db.add(gen)
     except Exception as e:
@@ -358,24 +342,13 @@ def save_generation_to_db(model_name: str, prompt: str, status: str,
 
 
 def get_generations_from_db(limit: int = 20):
-    """Récupère l'historique des générations (retourne des dicts pour éviter DetachedInstanceError)."""
+    """Récupère l'historique des générations."""
     try:
         with get_db() as db:
             from sqlalchemy import desc
-            results = db.query(Generation).order_by(desc(Generation.created_at)).limit(limit).all()
-            return [
-                {
-                    "id": g.id, "model_name": g.model_name, "prompt": g.prompt,
-                    "status": g.status, "audio_url": g.audio_url,
-                    "audio_duration": g.audio_duration, "created_at": str(g.created_at),
-                    "completed_at": str(g.completed_at) if g.completed_at else None,
-                    "error_message": g.error_message,
-                }
-                for g in results
-            ]
+            return db.query(Generation).order_by(desc(Generation.created_at)).limit(limit).all()
     except Exception:
         return []
-
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -610,15 +583,15 @@ elif page == "📚 Bibliothèque":
         for gen in generations:
             with st.container():
                 cols = st.columns([1, 3, 1, 1])
-                status_icon = {"completed": "✅", "failed": "❌", "pending": "⏳"}.get(gen.get("status", "⏳"), "⏳")
+                status_icon = {"completed": "✅", "failed": "❌", "pending": "⏳"}.get(gen.status, "⏳")
                 with cols[0]:
-                    st.markdown(f"{status_icon} **{gen.get('model_name', 'unknown')}**")
+                    st.markdown(f"{status_icon} **{gen.model_name}**")
                 with cols[1]:
-                    if gen.get("audio_duration"):
-                        st.caption(f"⏱ {gen['audio_duration']:.1f}s")
+                    if gen.audio_duration:
+                        st.caption(f"⏱ {gen.audio_duration:.1f}s")
                 with cols[3]:
-                    if gen.get("status") == "completed" and gen.get("audio_url"):
-                        task_id = gen["audio_url"].split("/")[-1].replace(".wav", "")
+                    if gen.status == "completed" and gen.audio_url:
+                        task_id = gen.audio_url.split("/")[-1].replace(".wav", "")
                         file_path = os.path.join(settings.storage_dir, f"{task_id}.wav")
                         if os.path.exists(file_path):
                             st.audio(file_path, format="audio/wav")

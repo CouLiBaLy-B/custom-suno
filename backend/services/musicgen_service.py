@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
-from loguru import logger
+# logger = print  # replaced with print
 from backend.core.config import get_settings
 
 settings = get_settings()
@@ -42,13 +42,13 @@ class MusicGenService:
             return
 
         model_name = settings.musicgen_model
-        logger.info(f"Chargement MusicGen: {model_name}")
+        print(f"Chargement MusicGen: {model_name}")
 
         try:
             from audiocraft.models import MusicGen as MC
             self._model = MC.get_pretrained(model_name)
             self._model = self._model.to(self.device)
-            logger.info(f"✅ MusicGen chargé via audiocraft: {model_name}")
+            print(f"✅ MusicGen chargé via audiocraft: {model_name}")
         except ImportError:
             from transformers import AutoProcessor, MusicgenForConditionalGeneration
             self._processor = AutoProcessor.from_pretrained(model_name)
@@ -56,7 +56,7 @@ class MusicGenService:
                 model_name, torch_dtype=self.dtype
             )
             self._model = self._model.to(self.device)
-            logger.info(f"✅ MusicGen chargé via transformers: {model_name}")
+            print(f"✅ MusicGen chargé via transformers: {model_name}")
 
     async def generate(
         self,
@@ -85,7 +85,7 @@ class MusicGenService:
         if progress_callback:
             progress_callback(40)
 
-        logger.info(f"Génération MusicGen: '{prompt[:50]}...' ({duration}s)")
+        print(f"Génération MusicGen: '{prompt[:50]}...' ({duration}s)")
 
         if hasattr(self._model, 'set_generation_params'):
             # API audiocraft
@@ -118,5 +118,5 @@ class MusicGenService:
         if progress_callback:
             progress_callback(100)
 
-        logger.info(f"✅ MusicGen terminé: shape={audio.shape}, sr={sample_rate}")
+        print(f"✅ MusicGen terminé: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate

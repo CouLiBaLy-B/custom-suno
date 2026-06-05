@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
-from loguru import logger
+# logger = print  # replaced with print
 from backend.core.config import get_settings
 
 settings = get_settings()
@@ -35,12 +35,12 @@ class BarkService:
         if self._model is not None:
             return
 
-        logger.info(f"Chargement Bark: {settings.bark_model}")
+        print(f"Chargement Bark: {settings.bark_model}")
         from transformers import AutoProcessor, BarkModel
         self._processor = AutoProcessor.from_pretrained(settings.bark_model)
         self._model = BarkModel.from_pretrained(settings.bark_model)
         self._model = self._model.to(self.device)
-        logger.info("✅ Bark chargé")
+        print("✅ Bark chargé")
 
     async def generate(
         self,
@@ -63,7 +63,7 @@ class BarkService:
         if progress_callback:
             progress_callback(40)
 
-        logger.info(f"Génération Bark: '{text[:50]}...'")
+        print(f"Génération Bark: '{text[:50]}...'")
 
         audios = []
         for i in range(num_variations):
@@ -84,5 +84,5 @@ class BarkService:
         if progress_callback:
             progress_callback(100)
 
-        logger.info(f"✅ Bark terminé: shape={result.shape}, sr={sample_rate}")
+        print(f"✅ Bark terminé: shape={result.shape}, sr={sample_rate}")
         return result, sample_rate

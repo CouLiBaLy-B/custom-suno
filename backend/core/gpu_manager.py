@@ -8,7 +8,7 @@ import threading
 from contextlib import contextmanager
 from typing import Dict, Optional
 import torch
-from loguru import logger
+# logger = print  # replaced with print
 from backend.core.config import get_settings
 
 settings = get_settings()
@@ -44,19 +44,19 @@ class GPUManager:
         self._max_cached_models = 2
         self._device = self._detect_device()
         self._dtype = self._detect_dtype()
-        logger.info(f"GPUManager initialisé - Device: {self._device}, Dtype: {self._dtype}")
+        print(f"GPUManager initialisé - Device: {self._device}, Dtype: {self._dtype}")
 
     def _detect_device(self) -> str:
         if settings.device == "cuda" and torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            logger.info(f"GPU détecté: {gpu_name} ({gpu_memory:.1f} GB)")
+            print(f"GPU détecté: {gpu_name} ({gpu_memory:.1f} GB)")
             return "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            logger.info("MPS (Apple Silicon) détecté")
+            print("MPS (Apple Silicon) détecté")
             return "mps"
         else:
-            logger.warning("Aucun GPU détecté, utilisation du CPU")
+            print("Aucun GPU détecté, utilisation du CPU")
             return "cpu"
 
     def _detect_dtype(self) -> torch.dtype:
@@ -94,13 +94,13 @@ class GPUManager:
         """Charge un modèle en mémoire avec gestion de cache LRU."""
         if model_id in self._loaded_models:
             self._model_usage[model_id] += 1
-            logger.debug(f"Modèle '{model_id}' déjà chargé en cache")
+            print(f"Modèle '{model_id}' déjà chargé en cache")
             return self._loaded_models[model_id]
 
         self._evict_least_used()
         self._free_memory()
 
-        logger.info(f"Chargement du modèle '{model_id}' (quantization: {use_quantization})")
+        print(f"Chargement du modèle '{model_id}' (quantization: {use_quantization})")
 
         try:
             model = model_loader()
@@ -110,18 +110,18 @@ class GPUManager:
 
             self._loaded_models[model_id] = model
             self._model_usage[model_id] = 1
-            logger.info(f"✅ Modèle '{model_id}' chargé avec succès")
+            print(f"✅ Modèle '{model_id}' chargé avec succès")
 
             return model
 
         except Exception as e:
-            logger.error(f"❌ Échec du chargement du modèle '{model_id}': {e}")
+            print(f"❌ Échec du chargement du modèle '{model_id}': {e}")
             raise
 
     def unload_model(self, model_id: str) -> None:
         """Décharge un modèle spécifique de la mémoire."""
         if model_id in self._loaded_models:
-            logger.info(f"Déchargement du modèle '{model_id}'")
+            print(f"Déchargement du modèle '{model_id}'")
             del self._loaded_models[model_id]
             del self._model_usage[model_id]
             self._free_memory()
@@ -130,7 +130,7 @@ class GPUManager:
         """Évince le modèle le moins utilisé du cache."""
         if len(self._loaded_models) >= self._max_cached_models:
             least_used = min(self._model_usage, key=self._model_usage.get)
-            logger.info(f"Éviction du modèle '{least_used}' du cache")
+            print(f"Éviction du modèle '{least_used}' du cache")
             self.unload_model(least_used)
 
     def _free_memory(self) -> None:
@@ -138,7 +138,7 @@ class GPUManager:
         gc.collect()
         if self._device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
-            logger.debug(f"VRAM après nettoyage: {self.get_vram_usage()}")
+            print(f"VRAM après nettoyage: {self.get_vram_usage()}")
 
     def get_model(self, model_id: str) -> Optional[object]:
         """Récupère un modèle du cache."""
@@ -149,7 +149,7 @@ class GPUManager:
 
     def clear_cache(self) -> None:
         """Vide complètement le cache de modèles."""
-        logger.info("Vidage du cache de modèles")
+        print("Vidage du cache de modèles")
         self._loaded_models.clear()
         self._model_usage.clear()
         self._free_memory()
