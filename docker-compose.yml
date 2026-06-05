@@ -1,0 +1,64 @@
+version: '3.8'
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - musicnet
+    volumes:
+      - ./frontend:/app/frontend
+      - audio_storage:/app/storage
+    restart: unless-stopped
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      - redis
+    networks:
+      - musicnet
+    volumes:
+      - ./backend:/app/backend
+      - audio_storage:/app/storage
+      - model_cache:/app/models
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - api
+      - redis
+    networks:
+      - musicnet
+    volumes:
+      - audio_storage:/app/storage
+      - model_cache:/app/models
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - musicnet
+    restart: unless-stopped
+networks:
+  musicnet:
+    driver: bridge
+volumes:
+  audio_storage:
+  model_cache:
