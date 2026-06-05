@@ -3,9 +3,13 @@ AI Music Studio — Interface Streamlit complète
 """
 from __future__ import annotations
 import os
+import sys
 import requests
 import streamlit as st
 
+# ── API URL : auto-détection ──
+# Sur HF Spaces, l'API tourne sur le même conteneur port 8000
+# En local, on utilise la variable d'environnement
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
 st.set_page_config(
@@ -59,18 +63,32 @@ def check_api():
 
 
 def submit_generation(req: dict):
-    r = requests.post(f"{API_URL}/api/generate", json=req, timeout=10)
-    return r.json() if r.status_code == 200 else None
+    try:
+        r = requests.post(f"{API_URL}/api/generate", json=req, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            st.error(f"Erreur API: {r.status_code} - {r.text}")
+            return None
+    except Exception as e:
+        st.error(f"Erreur de connexion: {e}")
+        return None
 
 
 def get_status(task_id: str):
-    r = requests.get(f"{API_URL}/api/generate/{task_id}", timeout=5)
-    return r.json() if r.status_code == 200 else None
+    try:
+        r = requests.get(f"{API_URL}/api/generate/{task_id}", timeout=5)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
 
 
 def download_audio(task_id: str):
-    r = requests.get(f"{API_URL}/api/audio/{task_id}.wav", timeout=30)
-    return r.content if r.status_code == 200 else None
+    try:
+        r = requests.get(f"{API_URL}/api/audio/{task_id}.wav", timeout=30)
+        return r.content if r.status_code == 200 else None
+    except Exception:
+        return None
 
 
 # ─── Header ───
@@ -79,7 +97,10 @@ st.caption("Génération musicale IA open source — MusicGen · Stable Audio ·
 
 api_ok = check_api()
 if not api_ok:
-    st.warning("⚠️ API backend non disponible. Les appels de génération échoueront.")
+    st.warning(f"⚠️ API backend non disponible sur {API_URL}. Les appels de génération échoueront.")
+    st.info("💡 Si vous êtes sur HF Spaces, l'API peut mettre quelques secondes à démarrer.")
+else:
+    st.success("✅ API backend connectée")
 
 # ─── Sidebar ───
 page = st.sidebar.radio("🎛️ Module", [
@@ -107,13 +128,11 @@ if page == "🎸 MusicGen":
             "🎸 Rock": "rock with guitars and drums",
             "🎹 Piano": "calm piano melody",
             "🎧 Electro": "electronic dance music",
-            "🎷 Jazz": "smooth jazz with saxophone",
-            "🌿 Ambient": "ambient nature soundscape",
         }
 
-        cols = st.columns(3)
+        cols = st.columns(4)
         for i, (label, text) in enumerate(presets.items()):
-            with cols[i % 3]:
+            with cols[i]:
                 if st.button(label, use_container_width=True):
                     st.session_state["mg_prompt"] = text
                     st.rerun()
@@ -130,17 +149,18 @@ if page == "🎸 MusicGen":
     st.markdown("---")
     if st.button("🎵 Générer (MusicGen)", type="primary", use_container_width=True):
         if prompt:
-            res = submit_generation({
-                "model_name": "musicgen",
-                "prompt": prompt,
-                "duration": dur,
-                "temperature": temp,
-                "num_variations": nvar,
-                "seed": seed,
-            })
-            if res:
-                st.session_state["task"] = res["task_id"]
-                st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
+            with st.spinner("🎵 Génération en cours..."):
+                res = submit_generation({
+                    "model_name": "musicgen",
+                    "prompt": prompt,
+                    "duration": dur,
+                    "temperature": temp,
+                    "num_variations": nvar,
+                    "seed": seed,
+                })
+                if res:
+                    st.session_state["task"] = res["task_id"]
+                    st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
         else:
             st.error("❌ Entrez une description pour votre musique.")
 
@@ -156,7 +176,7 @@ elif page == "🔊 Stable Audio":
             height=100,
         )
         neg = st.text_area(
-            "🚫 Negative prompt (ce qu'on ne veut PAS)",
+            "🚫 Negative prompt",
             placeholder="low quality, distorted, noisy",
             height=60,
         )
@@ -186,17 +206,18 @@ elif page == "🔊 Stable Audio":
     st.markdown("---")
     if st.button("🔊 Générer (Stable Audio)", type="primary", use_container_width=True):
         if prompt:
-            res = submit_generation({
-                "model_name": "stable_audio",
-                "prompt": prompt,
-                "negative_prompt": neg,
-                "duration": dur,
-                "num_variations": nvar,
-                "seed": seed,
-            })
-            if res:
-                st.session_state["task"] = res["task_id"]
-                st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
+            with st.spinner("🔊 Génération en cours..."):
+                res = submit_generation({
+                    "model_name": "stable_audio",
+                    "prompt": prompt,
+                    "negative_prompt": neg,
+                    "duration": dur,
+                    "num_variations": nvar,
+                    "seed": seed,
+                })
+                if res:
+                    st.session_state["task"] = res["task_id"]
+                    st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
         else:
             st.error("❌ Entrez une description pour le son.")
 
@@ -226,15 +247,16 @@ elif page == "🗣️ Bark":
     st.markdown("---")
     if st.button("🗣️ Générer (Bark)", type="primary", use_container_width=True):
         if text:
-            res = submit_generation({
-                "model_name": "bark",
-                "prompt": text,
-                "num_variations": nvar,
-                "seed": seed,
-            })
-            if res:
-                st.session_state["task"] = res["task_id"]
-                st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
+            with st.spinner("🗣️ Génération en cours..."):
+                res = submit_generation({
+                    "model_name": "bark",
+                    "prompt": text,
+                    "num_variations": nvar,
+                    "seed": seed,
+                })
+                if res:
+                    st.session_state["task"] = res["task_id"]
+                    st.success(f"✅ Lancé ! Task ID: `{res['task_id']}`")
         else:
             st.error("❌ Entrez du texte ou des paroles.")
 
@@ -267,6 +289,10 @@ elif page == "📚 Bibliothèque":
                     )
             elif status["status"] == "failed":
                 st.error(f"❌ Échec: {status.get('error', 'Erreur inconnue')}")
+            else:
+                st.info("⏳ Génération en cours... Patientez.")
+                if st.button("🔄 Rafraîchir le statut"):
+                    st.rerun()
     else:
         st.info("📂 Aucune génération en cours. Allez dans un module pour créer de la musique !")
 
