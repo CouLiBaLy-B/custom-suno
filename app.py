@@ -1,7 +1,8 @@
 """
-AI Music Studio — Single-file Streamlit App for Hugging Face Spaces
+AI Music Studio — Single-file Streamlit App
 Architecture : tout dans un seul fichier, appels directs aux services IA.
 Zero subprocess, zero FastAPI séparé, zero problème de port.
+Fonctionne nativement sur HF Spaces SDK streamlit.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import streamlit as st
 from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
+import threading
 
 # ── sys.path ──
 app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +28,10 @@ os.chdir(app_dir)
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 class Settings:
     database_url: str = os.environ.get("DATABASE_URL", "sqlite:///./musicstudio.db")
@@ -54,9 +57,10 @@ class Settings:
 
 settings = Settings()
 
-# ═══════════════════════════════════════════════════════
-#  DATABASE (SQLite local)
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════════════════════════
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -79,9 +83,10 @@ def get_db():
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
 #  MODELS ORM
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 class User(Base):
     __tablename__ = "users"
@@ -118,11 +123,10 @@ class Generation(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
-# ═══════════════════════════════════════════════════════
-#  AI SERVICES (lazy, thread-safe)
-# ═══════════════════════════════════════════════════════
 
-import threading
+# ═══════════════════════════════════════════════════════════════
+#  AI SERVICES
+# ═══════════════════════════════════════════════════════════════
 
 class MusicGenService:
     _instance = None
@@ -297,12 +301,13 @@ class BarkService:
         print(f"✅ Bark done: shape={result.shape}, sr={sample_rate}")
         return result, sample_rate
 
-# ═══════════════════════════════════════════════════════
-#  SAVE & LOAD HELPERS
-# ═══════════════════════════════════════════════════════
 
-def save_audio(audio_data, sample_rate: int) -> str:
-    """Sauvegarde l'audio et retourne le chemin du fichier."""
+# ═══════════════════════════════════════════════════════════════
+#  SAVE & LOAD HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def save_audio(audio_data, sample_rate: int) -> tuple:
+    """Sauvegarde l'audio et retourne (file_path, task_id, duration_sec)."""
     audio_np = audio_data.cpu().numpy() if hasattr(audio_data, 'cpu') else np.array(audio_data)
     if audio_np.ndim == 1:
         audio_np = audio_np.reshape(1, -1)
@@ -311,6 +316,7 @@ def save_audio(audio_data, sample_rate: int) -> str:
     sf.write(file_path, audio_np.T, sample_rate)
     duration_sec = audio_np.shape[-1] / sample_rate
     return file_path, task_id, duration_sec
+
 
 def save_generation_to_db(model_name: str, prompt: str, status: str,
                           audio_url: str = None, duration: float = None,
@@ -334,6 +340,7 @@ def save_generation_to_db(model_name: str, prompt: str, status: str,
     except Exception as e:
         print(f"⚠️ Erreur sauvegarde DB: {e}")
 
+
 def get_generations_from_db(limit: int = 20):
     """Récupère l'historique des générations."""
     try:
@@ -343,9 +350,10 @@ def get_generations_from_db(limit: int = 20):
     except Exception:
         return []
 
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
 #  STREAMLIT UI
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 # Init DB
 init_db()
@@ -376,12 +384,9 @@ st.markdown("""
         border-radius: 25px;
         width: 100%;
     }
-    .status-badge {
-        display: inline-block;
-        padding: 5px 15px;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 600;
+    .stButton > button:hover {
+        transform: scale(1.02);
+        box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -398,9 +403,9 @@ page = st.sidebar.radio("🎛️ Module", [
     "📚 Bibliothèque",
 ])
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  PAGE: MusicGen
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 if page == "🎸 MusicGen":
     st.header("🎸 Génération Instrumentale (MusicGen)")
     c1, c2 = st.columns([2, 1])
@@ -448,7 +453,6 @@ if page == "🎸 MusicGen":
                     save_generation_to_db("musicgen", prompt, "completed",
                                           audio_url=f"/api/audio/{task_id}.wav",
                                           duration=duration_sec)
-
                     st.success(f"✅ Généré ! ({duration_sec:.1f}s, {sr}Hz)")
                     st.audio(file_path, format="audio/wav")
                     with open(file_path, "rb") as f:
@@ -460,9 +464,9 @@ if page == "🎸 MusicGen":
         else:
             st.error("❌ Entrez une description pour votre musique.")
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  PAGE: Stable Audio
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 elif page == "🔊 Stable Audio":
     st.header("🔊 Effets Sonores (Stable Audio Open)")
     c1, c2 = st.columns([2, 1])
@@ -520,9 +524,9 @@ elif page == "🔊 Stable Audio":
         else:
             st.error("❌ Entrez une description pour le son.")
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  PAGE: Bark
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 elif page == "🗣️ Bark":
     st.header("🗣️ Voix & Jingles (Bark)")
     c1, c2 = st.columns([2, 1])
@@ -568,9 +572,9 @@ elif page == "🗣️ Bark":
         else:
             st.error("❌ Entrez du texte ou des paroles.")
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  PAGE: Bibliothèque
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 elif page == "📚 Bibliothèque":
     st.header("📚 Bibliothèque de Générations")
 
@@ -583,8 +587,6 @@ elif page == "📚 Bibliothèque":
                 with cols[0]:
                     st.markdown(f"{status_icon} **{gen.model_name}**")
                 with cols[1]:
-                    st.caption(f"`{gen.prompt[:60]}...`" if len(gen.prompt) > 60 else f"`{gen.prompt}`")
-                with cols[2]:
                     if gen.audio_duration:
                         st.caption(f"⏱ {gen.audio_duration:.1f}s")
                 with cols[3]:
@@ -595,8 +597,8 @@ elif page == "📚 Bibliothèque":
                             st.audio(file_path, format="audio/wav")
             st.divider()
     else:
-        st.info("📂 Aucune génération enregistrée. Commencez par créer de la musique !")
+        st.info("📂 Aucune génération enregistrée.")
 
 # ─── Footer ───
 st.markdown("---")
-st.caption(f"🎵 **AI Music Studio** v0.1.0 | Device: {settings.device} | Storage: {settings.storage_dir}")
+st.caption(f"🎵 **AI Music Studio** v0.1.0 | Device: {settings.device}")
