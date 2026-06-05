@@ -1,3 +1,1 @@
-"""
-Workers package initialization
-"""
+"""Celery workers."""

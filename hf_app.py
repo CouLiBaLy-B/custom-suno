@@ -1,72 +1,72 @@
 """
 AI Music Studio — Hugging Face Spaces Entry Point
-Point d'entrée principal pour le déploiement sur HF Spaces.
+Lance le backend FastAPI ET le frontend Streamlit.
 """
 import os
-import subprocess
 import sys
+import subprocess
 import threading
+import time
 
-def install_deps():
-    """Installe les dépendances manquantes."""
-    req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
-    if os.path.exists(req_file):
-        print("📦 Installing dependencies...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", req_file, "--quiet"],
-            check=False,
-        )
-        print("✅ Dependencies installed")
+# Ajouter le dossier courant au PYTHONPATH
+app_dir = os.path.dirname(os.path.abspath(__file__))
+if app_dir not in sys.path:
+    sys.path.insert(0, app_dir)
+
+os.chdir(app_dir)
 
 def launch_api():
     """Lance l'API FastAPI en arrière-plan."""
-    api_file = os.path.join(os.path.dirname(__file__), "backend", "api", "main.py")
-    if os.path.exists(api_file):
-        print("🚀 Launching FastAPI backend on port 8000...")
-        subprocess.run(
-            [
-                sys.executable, "-m", "uvicorn",
-                "backend.api.main:app",
-                "--host", "0.0.0.0",
-                "--port", "8000",
-            ],
-            cwd=os.path.dirname(__file__),
-        )
+    print("🚀 Launching FastAPI backend on port 8000...")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = app_dir + ":" + env.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "uvicorn",
+            "backend.api.main:app",
+            "--host", "0.0.0.0",
+            "--port", "8000",
+            "--log-level", "info",
+        ],
+        env=env,
+        cwd=app_dir,
+    )
+    print(f"⚠️ API process exited with code: {result.returncode}")
 
 def launch_frontend():
     """Lance le frontend Streamlit."""
-    frontend_file = os.path.join(os.path.dirname(__file__), "frontend", "app.py")
-    if os.path.exists(frontend_file):
-        print(f"🚀 Launching Streamlit frontend on port 7860...")
-        subprocess.run(
-            [
-                sys.executable, "-m", "streamlit", "run",
-                frontend_file,
-                "--server.port=7860",
-                "--server.address=0.0.0.0",
-                "--server.headless=true",
-            ],
-            env={**os.environ, "API_URL": "http://localhost:8000"},
-        )
-    else:
-        print("❌ frontend/app.py not found")
-        sys.exit(1)
+    # Attendre que l'API démarre
+    print("⏳ Attente du démarrage de l'API...")
+    time.sleep(5)
+    
+    print("🚀 Launching Streamlit frontend on port 7860...")
+    env = os.environ.copy()
+    env["API_URL"] = "http://localhost:8000"
+    env["PYTHONPATH"] = app_dir + ":" + env.get("PYTHONPATH", "")
+    subprocess.run(
+        [
+            sys.executable, "-m", "streamlit", "run",
+            os.path.join(app_dir, "frontend", "app.py"),
+            "--server.port=7860",
+            "--server.address=0.0.0.0",
+            "--server.headless=true",
+        ],
+        env=env,
+        cwd=app_dir,
+    )
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  🎵 AI Music Studio - Hugging Face Spaces")
+    print("  🎵 AI Music Studio - HF Spaces")
+    print("=" * 50)
+    print(f"  App directory: {app_dir}")
+    print(f"  Python: {sys.version}")
+    print(f"  PYTHONPATH: {os.environ.get('PYTHONPATH', 'not set')}")
     print("=" * 50)
     
-    # Installer les dépendances
-    install_deps()
-    
-    # Lancer l'API en arrière-plan
+    # Lancer l'API dans un thread
     api_thread = threading.Thread(target=launch_api, daemon=True)
     api_thread.start()
-    
-    # Attendre que l'API démarre
-    import time
-    time.sleep(5)
     
     # Lancer le frontend (bloque)
     launch_frontend()
