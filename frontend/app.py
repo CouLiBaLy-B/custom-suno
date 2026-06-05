@@ -1,16 +1,15 @@
 """
 AI Music Studio — Interface Streamlit complète
+URLs relatives pour compatibilité HF Spaces (port 7860)
 """
 from __future__ import annotations
 import os
-import sys
 import requests
 import streamlit as st
 
-# ── API URL : auto-détection ──
-# Sur HF Spaces, l'API tourne sur le même conteneur port 8000
-# En local, on utilise la variable d'environnement
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+# Sur HF Spaces, tout tourne sur le même host:port 7860
+# API_URL vide = URLs relatives (même host)
+API_URL = os.environ.get("API_URL", "").rstrip("/")
 
 st.set_page_config(
     page_title="🎵 AI Music Studio",
@@ -54,9 +53,16 @@ st.markdown("""
 
 
 # ─── Fonctions utilitaires ───
+def _api_url(path: str) -> str:
+    """Construit l'URL API correcte (relative ou absolue)."""
+    if API_URL:
+        return f"{API_URL}{path}"
+    return path
+
+
 def check_api():
     try:
-        r = requests.get(f"{API_URL}/api/health", timeout=3)
+        r = requests.get(_api_url("/api/health"), timeout=3)
         return r.status_code == 200
     except Exception:
         return False
@@ -64,20 +70,23 @@ def check_api():
 
 def submit_generation(req: dict):
     try:
-        r = requests.post(f"{API_URL}/api/generate", json=req, timeout=30)
+        r = requests.post(_api_url("/api/generate"), json=req, timeout=30)
         if r.status_code == 200:
             return r.json()
         else:
-            st.error(f"Erreur API: {r.status_code} - {r.text}")
+            st.error(f"Erreur API: {r.status_code} - {r.text[:200]}")
             return None
+    except requests.exceptions.ConnectionError:
+        st.error(f"❌ Impossible de joindre l'API sur {_api_url('/api/generate')}")
+        return None
     except Exception as e:
-        st.error(f"Erreur de connexion: {e}")
+        st.error(f"Erreur: {e}")
         return None
 
 
 def get_status(task_id: str):
     try:
-        r = requests.get(f"{API_URL}/api/generate/{task_id}", timeout=5)
+        r = requests.get(_api_url(f"/api/generate/{task_id}"), timeout=5)
         return r.json() if r.status_code == 200 else None
     except Exception:
         return None
@@ -85,7 +94,7 @@ def get_status(task_id: str):
 
 def download_audio(task_id: str):
     try:
-        r = requests.get(f"{API_URL}/api/audio/{task_id}.wav", timeout=30)
+        r = requests.get(_api_url(f"/api/audio/{task_id}.wav"), timeout=30)
         return r.content if r.status_code == 200 else None
     except Exception:
         return None
@@ -97,8 +106,8 @@ st.caption("Génération musicale IA open source — MusicGen · Stable Audio ·
 
 api_ok = check_api()
 if not api_ok:
-    st.warning(f"⚠️ API backend non disponible sur {API_URL}. Les appels de génération échoueront.")
-    st.info("💡 Si vous êtes sur HF Spaces, l'API peut mettre quelques secondes à démarrer.")
+    st.warning(f"⚠️ API backend non disponible sur {_api_url('/api/health')}")
+    st.info("💡 L'API peut mettre quelques secondes à démarrer. Rafraîchissez la page.")
 else:
     st.success("✅ API backend connectée")
 

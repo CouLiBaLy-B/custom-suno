@@ -1,12 +1,14 @@
 """
-AI Music Studio — Single-file Application
-Tout dans un seul fichier : modèles, services, API, frontend launcher.
-Zero problème d'import. Fonctionne sur HF Spaces, Docker, et local.
+AI Music Studio — Single-process Application pour Hugging Face Spaces
+Architecture : FastAPI sur port 7860 + Streamlit intégré (pas de subprocess)
+Zero problème d'import, zero problème de port, qualité maximale.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 # ── CRITIQUE : sys.path en TOUT premier ──
-import os, sys
 app_dir = os.path.dirname(os.path.abspath(__file__))
 if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
@@ -15,15 +17,16 @@ os.chdir(app_dir)
 import asyncio
 import json
 import uuid
+import threading
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Callable
 
 import numpy as np
 import soundfile as sf
-from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
@@ -34,12 +37,9 @@ from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 
 class Settings:
     host: str = os.environ.get("HOST", "0.0.0.0")
-    api_port: int = int(os.environ.get("API_PORT", "8000"))
-    streamlit_port: int = int(os.environ.get("STREAMLIT_PORT", "8501"))
+    port: int = int(os.environ.get("PORT", "7860"))
     debug: bool = os.environ.get("DEBUG", "false").lower() == "true"
     database_url: str = os.environ.get("DATABASE_URL", "sqlite:///./musicstudio.db")
-    celery_broker_url: str = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
-    celery_result_backend: str = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
     storage_path: str = os.environ.get("STORAGE_PATH", "./storage")
     model_cache_dir: str = os.environ.get("MODEL_CACHE_DIR", "./models")
     device: str = os.environ.get("DEVICE", "cpu")
@@ -196,7 +196,7 @@ class UserResponse(BaseModel):
     email: str
 
 # ═══════════════════════════════════════════════════════
-#  TASK STORE (in-memory pour le MVP)
+#  TASK STORE (in-memory)
 # ═══════════════════════════════════════════════════════
 
 _task_store: dict[str, dict] = {}
@@ -206,13 +206,14 @@ def _update_task(task_id: str, **kwargs):
         _task_store[task_id].update(kwargs)
 
 # ═══════════════════════════════════════════════════════
-#  AI SERVICES
+#  AI SERVICES (lazy import, thread-safe)
 # ═══════════════════════════════════════════════════════
 
 class MusicGenService:
     _instance = None
     _model = None
     _processor = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -229,27 +230,30 @@ class MusicGenService:
         return "cpu"
 
     def load_model(self):
-        if self._model is not None:
-            return
-        import torch
-        print(f"📥 Loading MusicGen: {settings.musicgen_model}")
-        try:
-            from audiocraft.models import MusicGen as MC
-            self._model = MC.get_pretrained(settings.musicgen_model)
-            self._model = self._model.to(self.device)
-            print("✅ MusicGen loaded via audiocraft")
-        except ImportError:
-            from transformers import AutoProcessor, MusicgenForConditionalGeneration
-            dtype = torch.float16 if self.device == "cuda" and settings.use_half_precision else torch.float32
-            self._processor = AutoProcessor.from_pretrained(settings.musicgen_model)
-            self._model = MusicgenForConditionalGeneration.from_pretrained(settings.musicgen_model, torch_dtype=dtype)
-            self._model = self._model.to(self.device)
-            print("✅ MusicGen loaded via transformers")
+        with self._lock:
+            if self._model is not None:
+                return
+            import torch
+            print(f"📥 Loading MusicGen: {settings.musicgen_model}")
+            try:
+                from audiocraft.models import MusicGen as MC
+                self._model = MC.get_pretrained(settings.musicgen_model)
+                self._model = self._model.to(self.device)
+                print("✅ MusicGen loaded via audiocraft")
+            except ImportError:
+                from transformers import AutoProcessor, MusicgenForConditionalGeneration
+                dtype = torch.float16 if self.device == "cuda" and settings.use_half_precision else torch.float32
+                self._processor = AutoProcessor.from_pretrained(settings.musicgen_model)
+                self._model = MusicgenForConditionalGeneration.from_pretrained(
+                    settings.musicgen_model, torch_dtype=dtype
+                )
+                self._model = self._model.to(self.device)
+                print("✅ MusicGen loaded via transformers")
 
     async def generate(self, prompt: str, duration: int = 15, temperature: float = 1.0,
                        top_k: int = 250, top_p: float = 0.0, cfg_coef: float = 3.0,
                        num_variations: int = 1, seed: int = -1,
-                       progress_callback=None):
+                       progress_callback: Optional[Callable[[int], None]] = None):
         import torch
         self.load_model()
         if progress_callback: progress_callback(20)
@@ -282,6 +286,7 @@ class MusicGenService:
 class StableAudioService:
     _instance = None
     _pipeline = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -298,21 +303,22 @@ class StableAudioService:
         return "cpu"
 
     def load_pipeline(self):
-        if self._pipeline is not None:
-            return
-        import torch
-        print(f"📥 Loading Stable Audio: {settings.stable_audio_model}")
-        from diffusers import StableAudioPipeline
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self._pipeline = StableAudioPipeline.from_pretrained(
-            settings.stable_audio_model, torch_dtype=dtype
-        )
-        self._pipeline = self._pipeline.to(self.device)
-        print("✅ Stable Audio loaded")
+        with self._lock:
+            if self._pipeline is not None:
+                return
+            import torch
+            print(f"📥 Loading Stable Audio: {settings.stable_audio_model}")
+            from diffusers import StableAudioPipeline
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            self._pipeline = StableAudioPipeline.from_pretrained(
+                settings.stable_audio_model, torch_dtype=dtype
+            )
+            self._pipeline = self._pipeline.to(self.device)
+            print("✅ Stable Audio loaded")
 
     async def generate(self, prompt: str, negative_prompt: str = None,
                        duration: float = 30.0, num_variations: int = 1,
-                       seed: int = -1, progress_callback=None):
+                       seed: int = -1, progress_callback: Optional[Callable[[int], None]] = None):
         import torch
         self.load_pipeline()
         if progress_callback: progress_callback(20)
@@ -336,6 +342,7 @@ class BarkService:
     _instance = None
     _model = None
     _processor = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -352,18 +359,19 @@ class BarkService:
         return "cpu"
 
     def load_model(self):
-        if self._model is not None:
-            return
-        print(f"📥 Loading Bark: {settings.bark_model}")
-        from transformers import AutoProcessor, BarkModel
-        self._processor = AutoProcessor.from_pretrained(settings.bark_model)
-        self._model = BarkModel.from_pretrained(settings.bark_model)
-        self._model = self._model.to(self.device)
-        print("✅ Bark loaded")
+        with self._lock:
+            if self._model is not None:
+                return
+            print(f"📥 Loading Bark: {settings.bark_model}")
+            from transformers import AutoProcessor, BarkModel
+            self._processor = AutoProcessor.from_pretrained(settings.bark_model)
+            self._model = BarkModel.from_pretrained(settings.bark_model)
+            self._model = self._model.to(self.device)
+            print("✅ Bark loaded")
 
     async def generate(self, text: str, voice_preset: str = "v2/fr_speaker_1",
                        duration: int = None, num_variations: int = 1,
-                       seed: int = -1, progress_callback=None):
+                       seed: int = -1, progress_callback: Optional[Callable[[int], None]] = None):
         import torch
         self.load_model()
         if progress_callback: progress_callback(20)
@@ -387,7 +395,7 @@ class BarkService:
         return result, sample_rate
 
 # ═══════════════════════════════════════════════════════
-#  FASTAPI APPLICATION
+#  FASTAPI APPLICATION (sur port 7860)
 # ═══════════════════════════════════════════════════════
 
 @asynccontextmanager
@@ -395,7 +403,7 @@ async def lifespan(fastapi_app: FastAPI):
     os.makedirs(settings.storage_dir, exist_ok=True)
     os.makedirs(settings.model_dir, exist_ok=True)
     init_db()
-    print("✅ AI Music Studio API démarrée")
+    print("✅ AI Music Studio API démarrée sur le port 7860")
     yield
     print("🛑 AI Music Studio API arrêtée")
 
@@ -413,6 +421,8 @@ api_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── API Endpoints ──
 
 @api_app.post("/api/generate", response_model=GenerationResponse)
 async def generate_music(
@@ -544,6 +554,63 @@ async def login(creds: LoginRequest, db: Session = Depends(get_db)):
 async def get_me():
     return UserResponse(id="anon", username="anonymous", email="anon@example.com")
 
+# ── Catch-all route : sert le frontend Streamlit ──
+
+def _run_streamlit_server():
+    """Lance le serveur Streamlit dans un thread séparé."""
+    import streamlit.web.bootstrap as bootstrap
+    from streamlit.web.server import Server as StreamlitServer
+    from streamlit import config as _config
+    
+    frontend_file = os.path.join(app_dir, "frontend", "app.py")
+    if not os.path.exists(frontend_file):
+        print(f"⚠️ Frontend non trouvé: {frontend_file}")
+        return
+    
+    print(f"🎨 Lancement de Streamlit depuis: {frontend_file}")
+    
+    # Configurer Streamlit pour utiliser le port 7861 (interne)
+    _config.set_option("server.port", 7861)
+    _config.set_option("server.address", "127.0.0.1")
+    _config.set_option("server.headless", True)
+    _config.set_option("browser.gatherUsageStats", False)
+    
+    try:
+        bootstrap.run(frontend_file, "", [], flag_options={})
+    except Exception as e:
+        print(f"⚠️ Erreur Streamlit: {e}")
+
+# ── Route pour servir le frontend ──
+# On utilise un proxy inverse ou on redirige vers Streamlit
+# La solution la plus simple : servir un HTML qui charge Streamlit en iframe
+
+FRONTEND_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Music Studio</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; }
+        iframe { width: 100vw; height: 100vh; border: none; }
+    </style>
+</head>
+<body>
+    <iframe src="http://127.0.0.1:7861/" title="AI Music Studio"></iframe>
+</body>
+</html>
+"""
+
+@api_app.get("/")
+async def root():
+    return HTMLResponse(content=FRONTEND_HTML)
+
+@api_app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    # Ne pas intercepter les routes API
+    if full_path.startswith("api/") or full_path.startswith("ws/"):
+        raise HTTPException(status_code=404)
+    return HTMLResponse(content=FRONTEND_HTML)
+
 # ═══════════════════════════════════════════════════════
 #  BACKGROUND GENERATION WORKER
 # ═══════════════════════════════════════════════════════
@@ -613,59 +680,34 @@ async def _run_generation(task_id: str, request: GenerationRequest):
                 db.commit()
 
 # ═══════════════════════════════════════════════════════
-#  LAUNCHER (quand exécuté directement via python app.py)
+#  ENTRY POINT
 # ═══════════════════════════════════════════════════════
 
-def launch_api():
-    """Lance l'API FastAPI en arrière-plan."""
-    import subprocess
-    print("🚀 Starting FastAPI backend on port 8000...")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = app_dir + ":" + env.get("PYTHONPATH", "")
-    result = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "app:api_app",
-         "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"],
-        env=env, cwd=app_dir,
-    )
-    if result.returncode != 0:
-        print(f"⚠️ API exited with code: {result.returncode}")
-
-def launch_frontend():
-    """Lance le frontend Streamlit."""
-    import subprocess
-    import time
-    # Attendre que l'API démarre
-    print("⏳ Waiting for API to start...")
-    time.sleep(5)
-
-    print("🚀 Starting Streamlit frontend on port 7860...")
-    env = os.environ.copy()
-    env["API_URL"] = "http://localhost:8000"
-    env["PYTHONPATH"] = app_dir + ":" + env.get("PYTHONPATH", "")
-    frontend_file = os.path.join(app_dir, "frontend", "app.py")
-    if os.path.exists(frontend_file):
-        subprocess.run(
-            [sys.executable, "-m", "streamlit", "run", frontend_file,
-             "--server.port=7860", "--server.address=0.0.0.0", "--server.headless=true"],
-            env=env, cwd=app_dir,
-        )
-    else:
-        print(f"❌ frontend/app.py not found at {frontend_file}")
-        sys.exit(1)
-
 if __name__ == "__main__":
-    import threading
+    import uvicorn
+    
     print("=" * 50)
     print("  🎵 AI Music Studio - HF Spaces")
     print("=" * 50)
     print(f"  App directory: {app_dir}")
     print(f"  Python: {sys.version}")
     print(f"  Device: {settings.device}")
+    print(f"  Port: {settings.port}")
     print("=" * 50)
-
-    # Lancer l'API dans un thread
-    api_thread = threading.Thread(target=launch_api, daemon=True)
-    api_thread.start()
-
-    # Lancer le frontend (bloque)
-    launch_frontend()
+    
+    # Lancer Streamlit dans un thread daemon
+    streamlit_thread = threading.Thread(target=_run_streamlit_server, daemon=True)
+    streamlit_thread.start()
+    
+    # Attendre que Streamlit démarre
+    import time
+    time.sleep(3)
+    
+    # Lancer FastAPI sur le port principal (7860)
+    print(f"🚀 Démarrage de FastAPI sur 0.0.0.0:{settings.port}")
+    uvicorn.run(
+        "app:api_app",
+        host="0.0.0.0",
+        port=settings.port,
+        log_level="info",
+    )
