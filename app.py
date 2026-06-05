@@ -13,7 +13,7 @@ import uuid
 import numpy as np
 import soundfile as sf
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from contextlib import contextmanager
 import threading
@@ -193,7 +193,7 @@ class MusicGenService:
                 do_sample=True, temperature=temperature, top_k=top_k, top_p=top_p,
             )
             audio = audio_values.cpu().numpy()
-            sample_rate = self._model.config.audio_encoder_sample_rate
+            sample_rate = self._model.config.sampling_rate
         print(f"✅ MusicGen done: shape={audio.shape}, sr={sample_rate}")
         return audio, sample_rate
 
@@ -333,8 +333,8 @@ def save_generation_to_db(model_name: str, prompt: str, status: str,
                 audio_url=audio_url,
                 audio_duration=duration,
                 error_message=error,
-                created_at=datetime.utcnow(),
-                completed_at=datetime.utcnow() if status != "pending" else None,
+                created_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc) if status != "pending" else None,
             )
             db.add(gen)
     except Exception as e:
